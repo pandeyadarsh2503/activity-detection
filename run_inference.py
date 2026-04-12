@@ -1,40 +1,44 @@
 """
-FIR Action Detection – Live Camera + Dataset Mode
-==================================================
+run_inference.py  —  Face-Gated Unified Activity Detection
+===========================================================
+Pipeline:
+  1. Face Authentication   (InsightFace buffalo_s)
+       → ONLY the pre-registered user passes through.
+  2. Posture Detection     (MediaPipe Pose)
+       sleeping / lying / falling / sitting / standing / walking
+  3. Intake Detection      (MediaPipe Pose landmarks)
+       eating / drinking + Bites Per Minute
+
+PRE-REQUISITE:
+  python register_face.py    ← run once to save face_auth/registered_face.npy
+
 USAGE:
-  python run_inference.py               --> Opens LIVE CAMERA (default)
-  python run_inference.py --dataset     --> Runs on the cloned dataset
-  python run_inference.py --video video105  --> Runs on one video from dataset
+  python run_inference.py               -->  Live camera (default)
+  python run_inference.py --cam 1       -->  Use camera index 1
+  python run_inference.py --dataset     -->  Dataset slideshow mode
+  python run_inference.py --video video105   -->  One dataset video
 
-HOW LIVE MODE WORKS:
-  Uses MediaPipe Pose to detect your body skeleton in real time.
-  Classifies your action based on the ANGLE of your body:
-    - Nearly horizontal  --> sleeping / lying
-    - Diagonal           --> falling
-    - Upright + still    --> standing
-    - Upright + moving   --> walking
-    - Hips low           --> sitting
-
-CONTROLS (live mode):
-  Q        --> Quit
-  S        --> Save screenshot
-  R        --> Reset / clear history
+LIVE CONTROLS:
+  Q  –  Quit
+  S  –  Save screenshot to output_results/screenshots/
+  R  –  Reset session counters (bites, posture history)
 """
 
 import cv2
+import sys
 import numpy as np
 import argparse
 import time
-import json
-import glob
-import os
+import threading
 from pathlib import Path
 from collections import deque
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATASET MODE helpers (unchanged from before)
-# ─────────────────────────────────────────────────────────────────────────────
+from detectors.posture_detector import PostureDetector, POSTURE_ACTIONS
+from detectors.intake_detector  import IntakeDetector, IntakeResult
+from detectors.posture_detector import PostureResult
+from display.hud import draw_skeleton, draw_mouth_box, draw_hud, draw_auth_overlay
 
+# ── Dataset helpers ────────────────────────────────────────────────────────────
 DATASET_DIR = Path(__file__).parent / "dataset"
 OUTPUT_DIR  = Path(__file__).parent / "output_results"
 
@@ -50,382 +54,473 @@ ACTION_COLORS = {
 }
 IMG_W, IMG_H = 320, 240
 
-def yolo_to_abs(cx, cy, w, h):
+
+def _yolo_to_abs(cx, cy, w, h):
     x1 = int((cx - w/2)*IMG_W); y1 = int((cy - h/2)*IMG_H)
     x2 = int((cx + w/2)*IMG_W); y2 = int((cy + h/2)*IMG_H)
     return max(0,x1), max(0,y1), min(IMG_W,x2), min(IMG_H,y2)
 
-def parse_bbox(path):
+def _parse_bbox(path):
     anns = []
-    if not Path(path).exists() or Path(path).stat().st_size == 0:
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
         return anns
-    with open(path) as f:
+    with open(p) as f:
         for line in f:
-            p = line.strip().split()
-            if len(p) >= 5:
-                anns.append((int(p[0]), *map(float, p[1:5])))
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                anns.append((int(parts[0]), *map(float, parts[1:5])))
     return anns
 
-def get_fnum(path):
+def _get_fnum(path):
     stem = Path(path).stem
     idx  = stem.rfind("_frame_")
     try:   return int(stem[idx+7:]) if idx != -1 else -1
     except: return -1
 
-def draw_box(frame, anns):
+def _draw_dataset_boxes(frame, anns):
     out = frame.copy()
     for cls, cx, cy, w, h in anns:
-        x1,y1,x2,y2 = yolo_to_abs(cx, cy, w, h)
+        x1, y1, x2, y2 = _yolo_to_abs(cx, cy, w, h)
         color = ACTION_COLORS.get(cls, (180,180,180))
         label = ACTION_LABELS.get(cls, str(cls))
         cv2.rectangle(out, (x1,y1), (x2,y2), color, 2)
-        (tw,th),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         cv2.rectangle(out, (x1, y1-th-8), (x1+tw+6, y1), color, -1)
-        cv2.putText(out, label, (x1+3,y1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20,20,20), 1, cv2.LINE_AA)
+        cv2.putText(out, label, (x1+3, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20,20,20), 1, cv2.LINE_AA)
     return out
 
 def run_dataset(video_name=None, max_frames=20):
-    """Show annotated frames from dataset in a window (slideshow)."""
     dirs = [DATASET_DIR / video_name] if video_name else sorted(DATASET_DIR.iterdir())
     dirs = [d for d in dirs if d.is_dir()]
-    print(f"\n[Dataset mode] {len(dirs)} video(s). Press SPACE=next  Q=quit\n")
+    print(f"\n[Dataset mode] {len(dirs)} video(s). SPACE=next  Q=quit\n")
     for vdir in dirs:
         bbox_dir = vdir / "BBOX"
         rgb_dir  = vdir / "RGB"
-        if not bbox_dir.is_dir(): continue
-        rgb_map  = {get_fnum(p): p for p in rgb_dir.glob("*.jpg")}
-        bbox_files = sorted(bbox_dir.glob("*.txt"), key=lambda p: get_fnum(p.name))
+        if not bbox_dir.is_dir():
+            continue
+        rgb_map    = {_get_fnum(p): p for p in rgb_dir.glob("*.jpg")}
+        bbox_files = sorted(bbox_dir.glob("*.txt"), key=lambda p: _get_fnum(p.name))
         shown = 0
         for bf in bbox_files:
-            fnum = get_fnum(bf.name)
-            if fnum not in rgb_map: continue
+            fnum = _get_fnum(bf.name)
+            if fnum not in rgb_map:
+                continue
             frame = cv2.imread(str(rgb_map[fnum]))
-            if frame is None: continue
-            anns = parse_bbox(bf)
-            if not anns: continue
-            annotated = draw_box(frame, anns)
-            # Scale up for visibility
-            display = cv2.resize(annotated, (640, 480))
-            labels = [ACTION_LABELS.get(a[0], str(a[0])) for a in anns]
-            info = f"[{vdir.name}]  frame {fnum}  |  Action: {', '.join(labels)}"
-            cv2.setWindowTitle("FIR Dataset Viewer", info)
+            if frame is None:
+                continue
+            anns = _parse_bbox(bf)
+            if not anns:
+                continue
+            display = cv2.resize(_draw_dataset_boxes(frame, anns), (640, 480))
+            labels  = [ACTION_LABELS.get(a[0], str(a[0])) for a in anns]
+            cv2.setWindowTitle("FIR Dataset Viewer",
+                               f"[{vdir.name}]  frame {fnum}  |  {', '.join(labels)}")
             cv2.imshow("FIR Dataset Viewer", display)
-            key = cv2.waitKey(100) & 0xFF   # auto-advance every 100ms
-            if key == ord('q'): cv2.destroyAllWindows(); return
+            key = cv2.waitKey(120) & 0xFF
+            if key == ord('q'):
+                cv2.destroyAllWindows()
+                return
             shown += 1
-            if max_frames and shown >= max_frames: break
+            if max_frames and shown >= max_frames:
+                break
     cv2.destroyAllWindows()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LIVE CAMERA helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-# Action info: (label, description, BGR color, emoji-like prefix)
-LIVE_ACTIONS = {
-    "sleeping":  ("SLEEPING",  "Person is sleeping on the floor",  (30, 80, 220),  "[ZZZ]"),
-    "lying":     ("LYING DOWN","Person is lying on the floor",      (200,60, 255),  "[LIE]"),
-    "falling":   ("FALLING!",  "Person appears to be falling",      (0,  60, 255),  "[!!!]"),
-    "sitting":   ("SITTING",   "Person is sitting",                  (255,140, 0),   "[ S ]"),
-    "standing":  ("STANDING",  "Person is standing still",           (50, 200, 50),  "[ | ]"),
-    "walking":   ("WALKING",   "Person is walking / moving",         (255,180, 20),  "[->]"),
-    "unknown":   ("DETECTING...","Waiting for clear pose detection", (120,120,120),  "[ ? ]"),
-}
+# ── Face Authentication Worker ─────────────────────────────────────────────────
 
-def angle_with_vertical(p1, p2):
-    """Angle between vector p1->p2 and the vertical axis (degrees). 0=up, 90=horizontal."""
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]  # positive = downward in image
-    angle = abs(np.degrees(np.arctan2(abs(dx), abs(dy))))
-    return angle                # 0° = perfectly vertical, 90° = horizontal
-
-def midpoint(a, b):
-    return ((a[0]+b[0])/2, (a[1]+b[1])/2)
-
-def classify_action(landmarks, h, w, motion_score, horizontal_duration):
+class FaceAuthWorker:
     """
-    Returns action key from LIVE_ACTIONS.
-    Uses MediaPipe landmark indices:
-      0=nose  11=L-shoulder 12=R-shoulder
-      23=L-hip  24=R-hip  25=L-knee  26=R-knee
+    Runs InsightFace face authentication in a dedicated background thread.
+
+    The worker re-embeds every FACE_SKIP_FRAMES frames to keep CPU usage
+    manageable.  Authentication state transitions follow this FSM:
+
+        WAITING  --[10 consecutive matches]--> AUTHENTICATED
+        AUTHENTICATED  --[no match > 2 s]--> WAITING (grace + reset)
+
+    Thread-safety: all shared state is protected by a single lock.
+    The main thread ONLY calls submit_frame() and get_results().
     """
-    try:
-        lm = landmarks.landmark
-        # Get key coordinates (normalized 0-1)
-        nose        = (lm[0].x,  lm[0].y)
-        l_shoulder  = (lm[11].x, lm[11].y)
-        r_shoulder  = (lm[12].x, lm[12].y)
-        l_hip       = (lm[23].x, lm[23].y)
-        r_hip       = (lm[24].x, lm[24].y)
-        l_knee      = (lm[25].x, lm[25].y)
-        r_knee      = (lm[26].x, lm[26].y)
 
-        shoulder_mid = midpoint(l_shoulder, r_shoulder)
-        hip_mid      = midpoint(l_hip, r_hip)
-        knee_mid     = midpoint(l_knee, r_knee)
+    def __init__(self, registered_emb: np.ndarray):
+        from face_auth.face_engine import FaceEngine
+        from face_auth import config as fa_cfg
 
-        # Visibility check
-        vis = [lm[i].visibility for i in [11,12,23,24]]
-        if min(vis) < 0.3:
-            return "unknown"
+        self._registered_emb = registered_emb
+        self._fa_cfg = fa_cfg
 
-        # Body tilt: angle from vertical (mid-shoulder → mid-hip vector)
-        body_angle = angle_with_vertical(shoulder_mid, hip_mid)
+        # Shared state (protected by lock)
+        self._lock            = threading.Lock()
+        self._latest_frame    = None          # BGR frame to process
+        self._is_authenticated = False
+        self._auth_bbox        = None         # smoothed bbox [x1,y1,x2,y2]
+        self._auth_sim         = 0.0
+        self._smooth_bbox      = None         # EMA smoother state
 
-        # How high are the hips in the frame (0=top, 1=bottom)
-        hip_y = hip_mid[1]
+        self._running   = True
+        self._fa_engine = None                # created inside thread
 
-        # ── Classification rules ──────────────────────────────────────────
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-        # 1. Sleeping / lying: body nearly horizontal (>55°)
-        if body_angle > 55:
-            if horizontal_duration > 3.0:
-                return "sleeping"
-            return "lying"
+    # ── Public API ─────────────────────────────────────────────────────────────
 
-        # 2. Falling: body tilted 35–55° AND not sustained
-        if body_angle > 35:
-            return "falling"
+    def submit_frame(self, bgr_frame: np.ndarray):
+        """Hand a new BGR frame to the auth worker (non-blocking)."""
+        with self._lock:
+            self._latest_frame = bgr_frame
 
-        # 3. Sitting: body upright but hips are below middle of frame
-        #    AND knees are roughly at hip level
-        knee_hip_diff = abs(knee_mid[1] - hip_mid[1])
-        if hip_y > 0.55 and knee_hip_diff < 0.15:
-            return "sitting"
+    def get_results(self):
+        """
+        Return (is_authenticated, auth_bbox, auth_sim).
+        Always safe to call from the main thread.
+        """
+        with self._lock:
+            return self._is_authenticated, self._auth_bbox, self._auth_sim
 
-        # 4. Walking: upright + significant motion
-        if motion_score > 1800:
-            return "walking"
+    def stop(self):
+        self._running = False
 
-        # 5. Standing still
-        return "standing"
+    # ── Internal ───────────────────────────────────────────────────────────────
 
-    except Exception:
-        return "unknown"
+    def _run(self):
+        from face_auth.face_engine import FaceEngine
+        fa_cfg = self._fa_cfg
+
+        engine = FaceEngine()
+
+        consecutive_matches  = 0
+        last_match_time      = None
+        frame_counter        = 0
+
+        while self._running:
+            # Grab latest frame
+            with self._lock:
+                frame = self._latest_frame
+                self._latest_frame = None
+
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            frame_counter += 1
+
+            # ── Re-embed only every FACE_SKIP_FRAMES ──────────────────────────
+            if frame_counter % fa_cfg.FACE_SKIP_FRAMES != 0:
+                continue
+
+            faces = engine.detect_and_embed(frame)
+            match = engine.best_match(faces, self._registered_emb)
+
+            now = time.time()
+
+            if match is not None:
+                raw_bbox, sim = match
+                last_match_time = now
+                consecutive_matches += 1
+
+                # EMA smooth the bounding box
+                smooth = self._ema_bbox(raw_bbox)
+
+                with self._lock:
+                    self._auth_sim  = sim
+                    self._auth_bbox = smooth
+                    if consecutive_matches >= fa_cfg.AUTH_CONSECUTIVE_FRAMES:
+                        self._is_authenticated = True
+            else:
+                consecutive_matches = 0
+                # Grace period: keep authenticated for IDENTITY_GRACE_SECONDS
+                # after the face disappears
+                if last_match_time is not None:
+                    elapsed = now - last_match_time
+                    if elapsed > fa_cfg.IDENTITY_GRACE_SECONDS:
+                        with self._lock:
+                            self._is_authenticated = False
+                            self._auth_bbox        = None
+                            self._auth_sim         = 0.0
+                        last_match_time = None
+                        self._smooth_bbox = None
+                else:
+                    with self._lock:
+                        self._is_authenticated = False
+
+    def _ema_bbox(self, new_bbox: np.ndarray) -> np.ndarray:
+        """Apply Exponential Moving Average to bbox to reduce jitter."""
+        alpha = self._fa_cfg.EMA_ALPHA
+        if self._smooth_bbox is None:
+            self._smooth_bbox = new_bbox.astype(float)
+        else:
+            self._smooth_bbox = alpha * new_bbox.astype(float) + \
+                                (1 - alpha) * self._smooth_bbox
+        return self._smooth_bbox.astype(int)
 
 
-def draw_skeleton(frame, results, mp_drawing, mp_pose):
-    """Draw pose landmarks on frame."""
-    mp_drawing.draw_landmarks(
-        frame,
-        results.pose_landmarks,
-        mp_pose.POSE_CONNECTIONS,
-        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0,220,255), thickness=2, circle_radius=3),
-        connection_drawing_spec=mp_drawing.DrawingSpec(color=(255,255,255), thickness=2),
+# ── Detection Worker (runs in background thread) ───────────────────────────────
+
+class DetectionWorker:
+    """
+    Runs MediaPipe + both detectors in a background thread.
+    Main thread feeds frames in; reads results out — no blocking.
+    """
+
+    def __init__(self, mp_pose, mp_face):
+        self._pose_model  = mp_pose
+        self._face_model  = mp_face
+        self._posture_det = PostureDetector(smoothing_frames=8)
+        self._intake_det  = IntakeDetector()
+
+        # Shared state (protected by lock)
+        self._lock         = threading.Lock()
+        self._latest_frame = None            # frame to process next
+        self._posture      = None            # latest posture result
+        self._intake       = None            # latest intake result
+        self._pose_result  = None            # latest raw pose result (for skeleton)
+        self._motion_score = 0.0
+
+        self._running = True
+        self._thread  = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit_frame(self, rgb_frame, motion_score: float):
+        """Hand a new frame to the worker (non-blocking)."""
+        with self._lock:
+            self._latest_frame = rgb_frame
+            self._motion_score = motion_score
+
+    def get_results(self):
+        """Return latest (posture, intake, pose_result). May be None at startup."""
+        with self._lock:
+            return self._posture, self._intake, self._pose_result
+
+    def reset(self):
+        with self._lock:
+            self._posture_det.reset()
+            self._intake_det.reset()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        """Worker loop — runs in background thread."""
+        with self._pose_model as pose_model, self._face_model as face_model:
+            while self._running:
+                # Grab latest frame (skip if none ready)
+                with self._lock:
+                    frame    = self._latest_frame
+                    motion   = self._motion_score
+                    self._latest_frame = None   # consume it
+
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
+
+                # Run MediaPipe
+                frame.flags.writeable = False
+                pose_res = pose_model.process(frame)
+                face_res = face_model.process(frame)
+                frame.flags.writeable = True
+
+                # Run detectors
+                h, w = frame.shape[:2]
+                fake_shape = (h, w, 3)
+                posture = self._posture_det.update(pose_res, motion)
+                intake  = self._intake_det.update(pose_res, face_res, fake_shape)
+
+                with self._lock:
+                    self._posture    = posture
+                    self._intake     = intake
+                    self._pose_result = pose_res
+
+
+# ── Fallback "idle" results for startup ───────────────────────────────────────
+
+def _idle_posture() -> PostureResult:
+    info = POSTURE_ACTIONS["unknown"]
+    return PostureResult(
+        action="unknown", label=info[0], description=info[1],
+        color=info[2], icon=info[3], body_angle=0.0, horizontal_duration=0.0,
+    )
+
+def _idle_intake() -> IntakeResult:
+    return IntakeResult(
+        is_intake=False, label="NOT EATING", description="",
+        color=(80, 80, 80), bpm=0.0, bite_count=0,
+        mouth_center=None, mouth_box=None, wrist_pt=None, confidence=0.0,
     )
 
 
-def draw_hud(frame, action_key, body_angle, fps, motion_score, h_duration, screenshot_flash):
-    """Draw the heads-up display overlay on the frame."""
-    fh, fw = frame.shape[:2]
-    info    = LIVE_ACTIONS[action_key]
-    label, description, color, prefix = info
+# ── Live camera ────────────────────────────────────────────────────────────────
 
-    # ── Top banner ──────────────────────────────────────────────────────────
-    banner_h = 80
-    overlay  = frame.copy()
-    cv2.rectangle(overlay, (0,0), (fw, banner_h), (15,15,15), -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-
-    # Action label (big, colored)
-    text = f"{prefix}  {label}"
-    cv2.putText(frame, text, (20, 52),
-                cv2.FONT_HERSHEY_DUPLEX, 1.5, color, 2, cv2.LINE_AA)
-
-    # ── Bottom info bar ──────────────────────────────────────────────────────
-    bar_y = fh - 85
-    overlay2 = frame.copy()
-    cv2.rectangle(overlay2, (0, bar_y), (fw, fh), (15,15,15), -1)
-    cv2.addWeighted(overlay2, 0.75, frame, 0.25, 0, frame)
-
-    # Description
-    cv2.putText(frame, description, (15, bar_y + 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220,220,220), 1, cv2.LINE_AA)
-
-    # Stats line
-    stats = f"Body angle: {body_angle:.1f}deg   Motion: {int(motion_score)}   FPS: {fps:.1f}"
-    if action_key in ("sleeping","lying"):
-        stats += f"   On floor: {h_duration:.1f}s"
-    cv2.putText(frame, stats, (15, bar_y + 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160,160,160), 1, cv2.LINE_AA)
-
-    # ── Color accent line at left edge ──────────────────────────────────────
-    cv2.rectangle(frame, (0, banner_h), (6, bar_y), color, -1)
-
-    # ── Controls hint ──────────────────────────────────────────────────────
-    ctrl = "Q=Quit  S=Screenshot  R=Reset"
-    cv2.putText(frame, ctrl, (fw-250, fh-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100,100,100), 1)
-
-    # ── Screenshot flash ────────────────────────────────────────────────────
-    if screenshot_flash > 0:
-        flash = frame.copy()
-        cv2.rectangle(flash, (0,0), (fw,fh), (255,255,255), -1)
-        cv2.addWeighted(flash, 0.3 * min(1.0, screenshot_flash), frame, 1 - 0.3*min(1.0,screenshot_flash), 0, frame)
-
-    return frame
-
-
-def run_live_camera(cam_index=0):
-    """Main live camera loop."""
+def run_live_camera(cam_index: int = 0):
     try:
         import mediapipe as mp
     except ImportError:
         print("[ERROR] mediapipe not installed. Run: pip install mediapipe")
         return
 
+    # ── Load registered face embedding ────────────────────────────────────────
+    from face_auth import config as fa_cfg
+    emb_path = Path(fa_cfg.EMBEDDING_FILE)
+    if not emb_path.exists():
+        print("\n" + "="*64)
+        print("  [ERROR] No registered face found.")
+        print(f"  Expected: {emb_path}")
+        print("\n  Please run:  python register_face.py")
+        print("  This captures 5 photos of your face and saves the")
+        print("  embedding so the system can recognise you.")
+        print("="*64 + "\n")
+        sys.exit(1)
+
+    registered_emb = np.load(str(emb_path))
+    print(f"[FaceAuth] Loaded registered embedding from {emb_path.name}")
+
     mp_pose    = mp.solutions.pose
+    mp_face    = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
 
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
-        print(f"[ERROR] Could not open camera index {cam_index}.")
-        print("  Try: python run_inference.py --cam 1")
+        print(f"[ERROR] Cannot open camera {cam_index}. Try --cam 1")
         return
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    print("\n" + "="*60)
-    print("  FIR Live Action Detection – Camera Active")
-    print("="*60)
-    print("  Controls: Q=Quit  S=Screenshot  R=Reset")
-    print("  The system will detect: sleeping, lying, falling,")
-    print("  sitting, standing, walking")
-    print("="*60 + "\n")
+    print("\n" + "="*62)
+    print("  Face-Gated Unified Activity Detection  —  Camera Active")
+    print("  Step 1: Look at the camera to authenticate.")
+    print("  Step 2: Activity detection starts automatically.")
+    print("="*62)
+    print("  Q=Quit   S=Screenshot   R=Reset session\n")
 
-    cv2.namedWindow("FIR Live Action Detection", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("FIR Live Action Detection", 1280, 720)
+    cv2.namedWindow("Unified Activity Detection", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Unified Activity Detection", 1280, 720)
 
-    # History / smoothing
-    action_history     = deque(maxlen=15)   # last 15 frames for smoothing
-    prev_gray          = None
-    fps_counter        = deque(maxlen=30)
-    horizontal_start   = None               # when body went horizontal
-    horizontal_duration = 0.0
-    screenshot_flash   = 0.0
-    screenshot_dir     = OUTPUT_DIR / "screenshots"
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-    shot_count = 0
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    shots_dir = OUTPUT_DIR / "screenshots"
+    shots_dir.mkdir(exist_ok=True)
 
-    with mp_pose.Pose(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-        model_complexity=1,
-    ) as pose:
+    # ── Start workers ──────────────────────────────────────────────────────────
+    face_worker = FaceAuthWorker(registered_emb)
 
+    activity_worker = DetectionWorker(
+        mp_pose.Pose(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            model_complexity=1,
+        ),
+        mp_face.FaceMesh(
+            max_num_faces=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            refine_landmarks=True,
+        ),
+    )
+
+    prev_gray        = None
+    fps_buf          = deque(maxlen=30)
+    screenshot_flash = 0.0
+    shot_count       = 0
+    frame_count      = 0
+
+    try:
         while True:
             t0 = time.time()
             ret, frame = cap.read()
             if not ret:
-                print("[WARN] Frame capture failed. Retrying...")
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
-            # Flip so it's mirror-like (more natural)
             frame = cv2.flip(frame, 1)
-            fh, fw = frame.shape[:2]
+            frame_count += 1
 
-            # ── Motion detection (frame difference) ──────────────────────
-            gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray_blur  = cv2.GaussianBlur(gray, (21,21), 0)
+            # ── Submit to face auth worker (always) ───────────────────────────
+            face_worker.submit_frame(frame.copy())
+
+            # ── Motion score ──────────────────────────────────────────────────
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gblur = cv2.GaussianBlur(gray, (21, 21), 0)
             if prev_gray is None:
-                prev_gray = gray_blur
-            diff         = cv2.absdiff(prev_gray, gray_blur)
+                prev_gray = gblur
+            diff         = cv2.absdiff(prev_gray, gblur)
             motion_score = float(np.sum(diff > 25))
-            prev_gray    = gray_blur
+            prev_gray    = gblur
 
-            # ── Pose estimation ──────────────────────────────────────────
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results  = pose.process(rgb)
-            rgb.flags.writeable = True
+            # ── Check auth, gate activity detection ───────────────────────────
+            is_auth, auth_bbox, auth_sim = face_worker.get_results()
 
-            body_angle = 0.0
-            raw_action = "unknown"
+            if is_auth:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                activity_worker.submit_frame(rgb, motion_score)
 
-            if results.pose_landmarks:
-                draw_skeleton(frame, results, mp_drawing, mp_pose)
+            # ── Read latest activity results ──────────────────────────────────
+            posture, intake, pose_result = activity_worker.get_results()
+            if posture is None: posture = _idle_posture()
+            if intake  is None: intake  = _idle_intake()
 
-                # Body angle for HUD
-                lm = results.pose_landmarks.landmark
-                sh_mid  = midpoint((lm[11].x, lm[11].y), (lm[12].x, lm[12].y))
-                hip_mid = midpoint((lm[23].x, lm[23].y), (lm[24].x, lm[24].y))
-                body_angle = angle_with_vertical(sh_mid, hip_mid)
+            # ── Draw: skeleton + mouth box (only when authenticated) ──────────
+            if is_auth:
+                draw_skeleton(frame, pose_result, mp_drawing, mp_pose)
+                draw_mouth_box(frame, intake)
 
-                # Track horizontal duration
-                if body_angle > 55:
-                    if horizontal_start is None:
-                        horizontal_start = time.time()
-                    horizontal_duration = time.time() - horizontal_start
-                else:
-                    horizontal_start    = None
-                    horizontal_duration = 0.0
+            # ── Frame timing & FPS ────────────────────────────────────────────
+            fps_buf.append(time.time() - t0)
+            fps = 1.0 / (sum(fps_buf) / len(fps_buf)) if fps_buf else 0
 
-                raw_action = classify_action(
-                    results.pose_landmarks, fh, fw,
-                    motion_score, horizontal_duration
-                )
-
-            # ── Smooth action over last N frames ─────────────────────────
-            action_history.append(raw_action)
-            counts     = {a: action_history.count(a) for a in set(action_history)}
-            best_action = max(counts, key=counts.get)
-
-            # ── FPS ───────────────────────────────────────────────────────
-            fps_counter.append(time.time() - t0)
-            fps = 1.0 / (sum(fps_counter) / len(fps_counter)) if fps_counter else 0
-
-            # ── Draw HUD ──────────────────────────────────────────────────
             if screenshot_flash > 0:
                 screenshot_flash -= 0.15
-            frame = draw_hud(
-                frame, best_action, body_angle,
-                fps, motion_score, horizontal_duration, screenshot_flash
-            )
 
-            cv2.imshow("FIR Live Action Detection", frame)
+            # ── Draw activity HUD (always — frozen at idle when not auth'd) ───
+            draw_hud(frame, posture, intake, fps, motion_score, screenshot_flash)
 
-            # ── Key handling ──────────────────────────────────────────────
+            # ── Draw auth overlay on top of everything ────────────────────────
+            draw_auth_overlay(frame, is_auth, auth_bbox, auth_sim, frame_count)
+
+            cv2.imshow("Unified Activity Detection", frame)
+
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
-                shot_path = screenshot_dir / f"shot_{int(time.time())}.jpg"
-                cv2.imwrite(str(shot_path), frame)
+                sp = shots_dir / f"shot_{int(time.time())}.jpg"
+                cv2.imwrite(str(sp), frame)
                 shot_count += 1
                 screenshot_flash = 1.5
-                print(f"  [Screenshot] Saved: {shot_path.name}")
+                print(f"  [Screenshot] {sp.name}")
             elif key == ord('r'):
-                action_history.clear()
-                horizontal_start    = None
-                horizontal_duration = 0.0
-                print("  [Reset] History cleared.")
+                activity_worker.reset()
+                print("  [Reset] Session counters cleared.")
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print(f"\n[Done] {shot_count} screenshot(s) saved to: {screenshot_dir}")
+    finally:
+        face_worker.stop()
+        activity_worker.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        if shot_count:
+            print(f"\n[Done] {shot_count} screenshot(s) -> {shots_dir}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FIR Action Detection – Live Camera or Dataset Mode"
+        description="Face-Gated Unified Activity Detection — Live Camera + FIR Dataset"
     )
-    parser.add_argument("--dataset",    action="store_true", help="Run on the cloned dataset instead of live camera")
-    parser.add_argument("--video",      default=None,        help="Dataset video folder name, e.g. 'video105'")
-    parser.add_argument("--max-frames", default=20, type=int,help="Max frames per video in dataset mode (0=all)")
-    parser.add_argument("--cam",        default=0,  type=int,help="Camera index (default 0). Try 1 if 0 doesn't work")
+    parser.add_argument("--dataset",    action="store_true",
+                        help="Run in dataset slideshow mode (no face auth)")
+    parser.add_argument("--video",      default=None,
+                        help="Name of a single dataset video folder")
+    parser.add_argument("--max-frames", default=20, type=int,
+                        help="Max frames per video in dataset mode (0=all)")
+    parser.add_argument("--cam",        default=0,  type=int,
+                        help="Camera index (default 0)")
     args = parser.parse_args()
 
     if args.video or args.dataset:
-        # ── Dataset slideshow mode ────────────────────────────────────────
-        mf = args.max_frames if args.max_frames > 0 else None
-        run_dataset(video_name=args.video, max_frames=mf)
+        run_dataset(video_name=args.video,
+                    max_frames=args.max_frames if args.max_frames > 0 else None)
     else:
-        # ── Live camera mode (default) ────────────────────────────────────
         run_live_camera(cam_index=args.cam)
 
 
