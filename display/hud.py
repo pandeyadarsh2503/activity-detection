@@ -178,42 +178,38 @@ def draw_hud(
 
 def draw_auth_overlay(
     frame,
-    is_authenticated: bool,
+    app_phase: int,
     auth_bbox,
     auth_sim: float,
     frame_count: int = 0,
+    countdown_val: int = 0,
 ):
     """
     Draw face-authentication state on the frame (in-place).
 
     Parameters
     ----------
-    is_authenticated : bool
-        True = registered user is live on camera.
+    app_phase : int
+        0 = WAITING, 1 = SUCCESS, 2 = COUNTDOWN, 3 = ACTIVE
     auth_bbox : np.ndarray | None
         [x1, y1, x2, y2] of the matched face, or None.
     auth_sim : float
         Latest cosine similarity score (0-1).
     frame_count : int
         Running frame counter — used to animate the waiting pulse.
-
-    Behaviour
-    ---------
-    - NOT authenticated: semi-transparent dark overlay + pulsing
-      "WAITING FOR FACE AUTHENTICATION" message in the centre.
-    - Authenticated: draws a green bounding box around the matched
-      face and a small "● AUTHORIZED (x.xx)" badge in the top-right
-      corner of the banner.
+    countdown_val : int
+        Remaining seconds for COUNTDOWN phase.
     """
     fh, fw = frame.shape[:2]
+    cy = fh // 2
+    cx = fw // 2
 
-    if not is_authenticated:
-        # ── Semi-transparent dark veil ─────────────────────────────────────
+    # ── Phase 0: WAITING ───────────────────────────────────────────────────────
+    if app_phase == 0:
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (fw, fh), (10, 10, 10), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-        # ── Pulsing text (alpha oscillates with frame_count) ───────────────
         pulse = 0.55 + 0.45 * abs(np.sin(frame_count * 0.06))  # 0.1–1.0
         text_color = tuple(int(c * pulse) for c in (80, 220, 80))   # dim green
 
@@ -225,26 +221,16 @@ def draw_auth_overlay(
         (tw2, th2), _ = cv2.getTextSize(line2, _FONT_MONO, 0.6, 1)
         (twh, thh), _ = cv2.getTextSize(hint,  _FONT_MONO, 0.38, 1)
 
-        cy = fh // 2
-        cv2.putText(frame, line1,
-                    ((fw - tw1) // 2, cy - 20),
-                    _FONT, 0.9, text_color, 2, cv2.LINE_AA)
-        cv2.putText(frame, line2,
-                    ((fw - tw2) // 2, cy + 20),
-                    _FONT_MONO, 0.6, (160, 160, 160), 1, cv2.LINE_AA)
-        cv2.putText(frame, hint,
-                    ((fw - twh) // 2, fh - 18),
-                    _FONT_MONO, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.putText(frame, line1, (cx - tw1 // 2, cy - 20), _FONT, 0.9, text_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, line2, (cx - tw2 // 2, cy + 20), _FONT_MONO, 0.6, (160, 160, 160), 1, cv2.LINE_AA)
+        cv2.putText(frame, hint, (cx - twh // 2, fh - 18), _FONT_MONO, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
         return
 
-    # ── Authenticated branch ───────────────────────────────────────────────────
-
-    # Green face bounding box
+    # Draw Green face bounding box in all phases after WAITING
     if auth_bbox is not None:
         x1, y1, x2, y2 = int(auth_bbox[0]), int(auth_bbox[1]), \
                           int(auth_bbox[2]), int(auth_bbox[3])
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 80), 2)
-        # Corner accents
         corner_len = 14
         corner_clr = (120, 255, 140)
         for dx, dy in [(0, 0), (x2 - x1, 0), (0, y2 - y1), (x2 - x1, y2 - y1)]:
@@ -254,10 +240,35 @@ def draw_auth_overlay(
             cv2.line(frame, (bx, by), (bx + sign_x * corner_len, by), corner_clr, 2)
             cv2.line(frame, (bx, by), (bx, by + sign_y * corner_len), corner_clr, 2)
 
-    # Small badge in top-right of banner area
-    badge = f"\u25cf AUTHORIZED  {auth_sim:.2f}"
-    (bw, bh), _ = cv2.getTextSize(badge, _FONT_MONO, 0.44, 1)
-    bx = fw - bw - 20
-    # Draw behind FPS counter
-    cv2.putText(frame, badge, (bx, 52),
-                _FONT_MONO, 0.44, (60, 230, 90), 1, cv2.LINE_AA)
+    # ── Phase 1: SUCCESS ───────────────────────────────────────────────────────
+    if app_phase == 1:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, cy - 80), (fw, cy + 80), (0, 40, 10), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        msg = "AUTHORIZATION SUCCESSFUL"
+        (tw, th), _ = cv2.getTextSize(msg, _FONT, 1.2, 2)
+        cv2.putText(frame, msg, (cx - tw // 2, cy + 10), _FONT, 1.2, (60, 255, 100), 2, cv2.LINE_AA)
+
+    # ── Phase 2: COUNTDOWN ─────────────────────────────────────────────────────
+    elif app_phase == 2:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (fw, fh), (10, 10, 10), -1)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+
+        # Draw huge countdown number
+        msg = str(countdown_val)
+        font_scale = 5.0 + abs(np.sin(frame_count * 0.15)) * 0.5  # Pop effect
+        (tw, th), _ = cv2.getTextSize(msg, _FONT, font_scale, 6)
+        cv2.putText(frame, msg, (cx - tw // 2, cy + th // 2), _FONT, font_scale, (255, 200, 50), 6, cv2.LINE_AA)
+        
+        hint = "Getting ready..."
+        (tw_h, th_h), _ = cv2.getTextSize(hint, _FONT, 0.8, 1)
+        cv2.putText(frame, hint, (cx - tw_h // 2, cy + 80), _FONT, 0.8, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── Phase 3: ACTIVE ────────────────────────────────────────────────────────
+    elif app_phase == 3:
+        badge = f"\u25cf AUTHORIZED  {auth_sim:.2f}"
+        (bw, bh), _ = cv2.getTextSize(badge, _FONT_MONO, 0.44, 1)
+        bx = fw - bw - 20
+        cv2.putText(frame, badge, (bx, 52), _FONT_MONO, 0.44, (60, 230, 90), 1, cv2.LINE_AA)

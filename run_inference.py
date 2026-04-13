@@ -418,6 +418,16 @@ def run_live_camera(cam_index: int = 0):
         ),
     )
 
+    # ── Application State Machine ──────────────────────────────────────────────
+    class AppPhase:
+        WAITING = 0
+        SUCCESS = 1
+        COUNTDOWN = 2
+        ACTIVE = 3
+
+    current_phase = AppPhase.WAITING
+    phase_start_time = 0.0
+
     prev_gray        = None
     fps_buf          = deque(maxlen=30)
     screenshot_flash = 0.0
@@ -447,10 +457,29 @@ def run_live_camera(cam_index: int = 0):
             motion_score = float(np.sum(diff > 25))
             prev_gray    = gblur
 
-            # ── Check auth, gate activity detection ───────────────────────────
+            # ── Check auth, manage phase transitions ──────────────────────────
             is_auth, auth_bbox, auth_sim = face_worker.get_results()
+            now = time.time()
 
-            if is_auth:
+            if current_phase == AppPhase.WAITING:
+                if is_auth:
+                    current_phase = AppPhase.SUCCESS
+                    phase_start_time = now
+            elif current_phase == AppPhase.SUCCESS:
+                if now - phase_start_time > 1.5:  # hold success for 1.5s
+                    current_phase = AppPhase.COUNTDOWN
+                    phase_start_time = now
+            elif current_phase == AppPhase.COUNTDOWN:
+                if now - phase_start_time > 3.0:  # 3s countdown
+                    current_phase = AppPhase.ACTIVE
+            elif current_phase == AppPhase.ACTIVE:
+                if not is_auth:
+                    # User left frame for > graceful timeout
+                    current_phase = AppPhase.WAITING
+                    activity_worker.reset()
+
+            # ── Gate activity detection ───────────────────────────────────────
+            if current_phase == AppPhase.ACTIVE:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 activity_worker.submit_frame(rgb, motion_score)
 
@@ -459,8 +488,8 @@ def run_live_camera(cam_index: int = 0):
             if posture is None: posture = _idle_posture()
             if intake  is None: intake  = _idle_intake()
 
-            # ── Draw: skeleton + mouth box (only when authenticated) ──────────
-            if is_auth:
+            # ── Draw: skeleton + mouth box (only when ACTIVE) ─────────────────
+            if current_phase == AppPhase.ACTIVE:
                 draw_skeleton(frame, pose_result, mp_drawing, mp_pose)
                 draw_mouth_box(frame, intake)
 
@@ -471,11 +500,14 @@ def run_live_camera(cam_index: int = 0):
             if screenshot_flash > 0:
                 screenshot_flash -= 0.15
 
-            # ── Draw activity HUD (always — frozen at idle when not auth'd) ───
+            # ── Draw activity HUD (always — frozen at idle when not active) ───
             draw_hud(frame, posture, intake, fps, motion_score, screenshot_flash)
 
             # ── Draw auth overlay on top of everything ────────────────────────
-            draw_auth_overlay(frame, is_auth, auth_bbox, auth_sim, frame_count)
+            remaining = 3 - int(now - phase_start_time)
+            countdown_val = max(1, remaining) if current_phase == AppPhase.COUNTDOWN else 0
+            
+            draw_auth_overlay(frame, current_phase, auth_bbox, auth_sim, frame_count, countdown_val)
 
             cv2.imshow("Unified Activity Detection", frame)
 
